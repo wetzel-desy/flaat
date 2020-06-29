@@ -8,11 +8,15 @@ access to OIDC authenticated REST APIs.'''
 # pylint: disable=logging-not-lazy, logging-format-interpolation
 # pylint: disable=wrong-import-position, no-self-use
 
+name = "flaat"
+__version__ = "0.6.3"
 
 from functools import wraps
 import json
 import os
 import sys
+import logging
+
 is_py2 = sys.version[0] == '2'
 if is_py2:
     from Queue import Queue, Empty
@@ -26,11 +30,8 @@ from aarc_g002_entitlement import Aarc_g002_entitlement
 from . import tokentools
 from . import issuertools
 from . import flaat_exceptions
-import logging
 
 logger = logging.getLogger(__name__)
-
-name = "flaat"
 
 #defaults; May be overwritten per initialisation of flaat
 verbose = 0
@@ -145,7 +146,7 @@ class Flaat():
         if framework_name in self.supported_web_frameworks:
             self.web_framework = framework_name
         else:
-            logger.error("Specified Web Framework '%s' is not supported" % framework_name)
+            logger.error(f"Specified Web Framework '{framework_name}' is not supported")
             exit (42)
     def _find_issuer_config_everywhere(self, access_token):
         '''Use many places to find issuer configs'''
@@ -214,7 +215,7 @@ class Flaat():
     def get_info_from_userinfo_endpoints(self, access_token):
         '''Traverse all reasonable configured userinfo endpoints and query them with the
         access_token. Note: For OPs that include the iss inside the AT, they will be directly
-        queried, and are not included in the search (because that makes no sense). 
+        queried, and are not included in the search (because that makes no sense).
         Returns user_info object or None.  If None is returned self.last_error is set with a
         meaningful message.'''
         # user_info = "" # return value
@@ -363,7 +364,7 @@ class Flaat():
                     return self._return_formatter_wf(on_failure(self.get_last_error()), 401)
 
                 return self._return_formatter_wf(\
-                        ('No valid authentication found: %s' % self.get_last_error()), 401)
+                        (f'No valid authentication found: {self.get_last_error()}'), 401)
             return decorated
         return wrapper
     def _determine_number_of_required_matches(self, match, req_group_list):
@@ -387,15 +388,15 @@ class Flaat():
         try:
             avail_group_entries = all_info[claim]
         except KeyError:
-            user_message = 'Not authorised (claim does not exist: "%s".)' % claim
+            user_message = f'Not authorised (claim does not exist: "{claim}".)'
             if self.verbose:
-                print ('Claim does not exist: "%s".' % claim)
+                print (f'Claim does not exist: "{claim}".')
                 print (json.dumps(all_info, sort_keys=True, indent=4, separators=(',', ': ')))
             return (None, user_message)
         if not isinstance(avail_group_entries, list):
-            user_message = 'Not authorised (claim does not point to a list: "%s".)' % avail_group_entries
+            user_message = f'Not authorised (claim does not point to a list: "{avail_group_entries}".)'
             if self.verbose:
-                print ('Claim does not point to a list: "%s".' % avail_group_entries)
+                print (f'Claim does not point to a list: "{avail_group_entries}".')
                 print (json.dumps(all_info, sort_keys=True, indent=4, separators=(',', ': ')))
             return (None, user_message)
 
@@ -424,7 +425,7 @@ class Flaat():
                 if all_info is None:
                     if on_failure:
                         return self._return_formatter_wf(on_failure(self.get_last_error()), 401)
-                    return self._return_formatter_wf('No valid authentication found. %s' % self.get_last_error(), 401)
+                    return self._return_formatter_wf(f'No valid authentication found. {self.get_last_error()}', 401)
 
                 req_group_list = ensure_is_list (group)
                 required_matches = self._determine_number_of_required_matches(match, req_group_list)
@@ -496,7 +497,7 @@ class Flaat():
                 if all_info is None:
                     if on_failure:
                         return self._return_formatter_wf(on_failure(self.get_last_error()), 401)
-                    return self._return_formatter_wf('No valid authentication found. %s' % self.get_last_error(), 401)
+                    return self._return_formatter_wf(f'No valid authentication found. {self.get_last_error()}', 401)
 
                 req_entitlement_list = ensure_is_list (entitlement)
                 # # # Make sure we have a list:
@@ -557,6 +558,61 @@ class Flaat():
                 user_message = 'You are not authorised'
 
                 # Either we returned above or there was no matching entitlement
+                if on_failure:
+                    return self._return_formatter_wf(on_failure(user_message), 403)
+                return self._return_formatter_wf(user_message, 403)
+            return decorated
+        return wrapper
+
+    def _get_single_entitlement_from_claim(self, all_info, claim):
+        '''Gets a single entitlement from claims and can e.g. check againt a whitelist.
+           Users, mail adresses and the like can be passed as whitelists.'''
+        try:
+            avail_claim_entries = all_info[claim]
+        except KeyError:
+            user_message = f'Not authorised (claim does not exist: "{claim}").'
+            if self.verbose:
+                print(f'Claim does not exist: "{claim}".')
+                print (json.dumps(all_info, sort_keys=True, indent=4, separators=(',', ': ')))
+            return (None, user_message)
+        return (avail_claim_entries, None)
+
+    def whitelist_login(self, whitelist=None, claim=None, on_failure=None):
+        '''Decorator to enforce whitelisting of claims. It can be used to whitelist
+        certain usernames or mail adresses for authentication. In contrast to "group_required()"
+        this funtion does not need a LIST of entitlements but rather a single entry which is
+        then checked against the whitelist.'''
+        def wrapper(view_func):
+            @wraps(view_func)
+            def decorated(*args, **kwargs):
+
+                try:
+                    if os.environ['DISABLE_AUTHENTICATION_AND_ASSUME_AUTHENTICATED_USER'].lower() == 'yes':
+                        return view_func(*args, **kwargs)
+                except KeyError: # i.e. the environment variable was not set
+                    pass
+
+                user_message = 'Entitlement not found in whitelist.'
+
+                request_object = self._find_request_based_on_web_framework(request, args)
+                all_info = self._get_all_info_from_request(request_object)
+
+                if all_info is None:
+                    if on_failure:
+                        return self._return_formatter_wf(on_failure(self.get_last_error()), 401)
+                    return self._return_formatter_wf(f'No valid authentication found. {self.get_last_error()}', 401)
+
+                (avail_claim_entries, user_message) = self._get_single_entitlement_from_claim(all_info, claim)
+                if not avail_claim_entries:
+                    return self._return_formatter_wf(user_message, 403)
+
+                if avail_claim_entries in whitelist:
+                    if self.verbose >= 2:
+                        print(f'User authenticated via whitelist with claim {avail_claim_entries}')
+                    return view_func(*args, **kwargs)
+
+                user_message = 'You are not authorised.'
+
                 if on_failure:
                     return self._return_formatter_wf(on_failure(user_message), 403)
                 return self._return_formatter_wf(user_message, 403)
